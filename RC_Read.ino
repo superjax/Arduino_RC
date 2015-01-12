@@ -9,6 +9,9 @@
 // include the pinchangeint library - allows us to make all 20 pins interuppt controlled.
 #include <PinChangeInt.h>
 #include <Servo.h>
+#include <ros.h>
+#include <std_msgs/Empty.h>
+#include <relative_nav_msgs/Command.h>
 
 // Assign your channel in pins
 #define ROLL_IN_PIN   8
@@ -49,16 +52,13 @@ volatile uint8_t UpdateFlagsShared;
 
 // shared variables are updated by the ISR (Interrupt Service Routine) and read by loop.
 // In loop we immediatley take local copies so that the ISR can keep ownership of the 
-// shared ones. To access these in loop
-// we first turn interrupts off with noInterrupts
-// we take a copy to use in loop and the turn interrupts back on
-// as quickly as possible, this ensures that we are always able to receive new signals
+// shared ones.
 volatile uint16_t RollInShared;
 volatile uint16_t PitchInShared;
 volatile uint16_t ThrustInShared;
 volatile uint16_t YawInShared;
 
-// These are used to record the rising edge of a pulse in the calcInput functions
+// These are used to record the rising edge of a pulse in the ISR functions
 // They do not need to be volatile as they are only used in the ISR. If we wanted
 // to refer to these in loop and the ISR then they would need to be declared volatile
 uint32_t RollStartEdgeISR;
@@ -67,30 +67,43 @@ uint32_t ThrustStartEdgeISR;
 uint32_t YawStartEdgeISR;
 int count;
 
+// these variables store the last RC and ROS updates in microseconds - used in determining if we have lost RC
+uint32_t LastRCUpdate;
+uint32_t LastROSUpdate;
+
+//ROS stuff
+volatile uint16_t RollROSPWMShared; // these are variables that are shared between the main loop() function and the ROS node
+volatile uint16_t PitchROSPWMShared;
+volatile uint16_t ThrustROSPWMShared;
+volatile uint16_t YawROSPWMShared;
+
+// Setup node handle
+ros::NodeHandle  nh;
+
+// Declare publishers
+relative_nav_msgs::Command command_msg;
+ros::Publisher chatter("debug", &command_msg);
+void commandCb( const relative_nav_msgs::Command& msg);
+ros::Subscriber<relative_nav_msgs::Command> sub_command("command", &commandCb );
+
+bool light;
+
 void setup()
 {
-  Serial.begin(115200);
-  Serial.println("multiChannels");
+  //Serial.begin(115200);
+  //Serial.println("multiChannels");
+  pinMode(13,OUTPUT);
 
   // attach ESCs
   Motor1.attach(MOTOR_1_PIN,  MIN_PWM_CMD,  MAX_PWM_CMD);
   Motor2.attach(MOTOR_2_PIN,  MIN_PWM_CMD,  MAX_PWM_CMD);
   Motor3.attach(MOTOR_3_PIN,  MIN_PWM_CMD,  MAX_PWM_CMD);
   Motor4.attach(MOTOR_4_PIN,  MIN_PWM_CMD,  MAX_PWM_CMD);
-  // arm ESCs
-  Serial.println("Arming");
-  Motor1.writeMicroseconds(MAX_PWM_CMD);
-  Motor2.writeMicroseconds(MAX_PWM_CMD);
-  Motor3.writeMicroseconds(MAX_PWM_CMD);
-  Motor4.writeMicroseconds(MAX_PWM_CMD);
-  delay(2000);
-  Motor1.writeMicroseconds(MIN_PWM_CMD);
-  Motor2.writeMicroseconds(MIN_PWM_CMD);
-  Motor3.writeMicroseconds(MIN_PWM_CMD);
-  Motor4.writeMicroseconds(MIN_PWM_CMD);
-  delay(2000);    
-  Serial.println("Done");
 
+    // setup ROS node
+  nh.initNode();
+  nh.subscribe(sub_command);
+  nh.advertise(chatter);
 
   // using the PinChangeInt library, attach the interrupts
   // used to read the channels
@@ -99,11 +112,16 @@ void setup()
   PCintPort::attachInterrupt(THRUST_IN_PIN, updateThrustcmd,   CHANGE); 
   PCintPort::attachInterrupt(YAW_IN_PIN,    updateYawcmd,     CHANGE);
   count = 0;
+
+  // initialize the LastRCUpdate variable
+  LastRCUpdate = millis();
+  LastROSUpdate = millis();
+  light = 1;
 }
 
 void loop()
 {
-  // create local variables to hold a local copies of the channel inputs
+  // create local variables to hold a local copies of the RC channel inputs
   // these are declared static so that thier values will be retained 
   // between calls to loop, but remain limited in scope to loop()
   static uint16_t RollInLocal;
@@ -111,9 +129,15 @@ void loop()
   static uint16_t ThrustInLocal;
   static uint16_t YawInLocal;
 
+  // static master output variables
+  static uint16_t RollOutMaster;
+  static uint16_t PitchOutMaster;
+  static uint16_t ThrustOutMaster;
+  static uint16_t YawOutMaster;
+
   // local copy of update flags
   static uint8_t UpdateFlagsLocal;
-
+ 
 
   /******************************/
   /****** RC CHANNELS UPDATE ****/
@@ -124,103 +148,178 @@ void loop()
     noInterrupts(); // turn interrupts off quickly while we take local copies of the shared variables
     // take a local copy of which channels were updated
     UpdateFlagsLocal = UpdateFlagsShared;
-    // update the local values of the channels based on the update flags    
+    // update the local and ros values based on flags
     if(UpdateFlagsLocal & ROLL_FLAG)
+    {
       RollInLocal = RollInShared;
-    if(UpdateFlagsLocal & PITCH_FLAG)
-      PitchInLocal = PitchInShared;    
-    if(UpdateFlagsLocal & THRUST_FLAG)
-      ThrustInLocal = ThrustInShared;
-    if(UpdateFlagsLocal & YAW_FLAG)
-      YawInLocal = YawInShared;
-     
-    // clear shared copy of updated flags as we have already taken the updates
-    // we still have a local copy if we need to use it in UpdateFlagsLocal
-    // this needs to be cleared so that we aren't always checking these variables and
-    // getting interrupts during the update
-    UpdateFlagsShared = 0;
-    
-    interrupts(); // turn back on interrupts - DONT USE SHARED VARIABLES ANYMORE
     }
-  if(count >= 10000)
-  {
-    Serial.print("Roll: ");
-    Serial.print(RollInLocal,DEC);
-    Serial.print("\t");
-    Serial.print("Pitch: ");
-    Serial.print(PitchInLocal,DEC);
-    Serial.print("\t");
-    Serial.print("Thrust: ");
-    Serial.print(ThrustInLocal,DEC);
-    Serial.print("\t");
-    Serial.print("Yaw: ");
-    Serial.print(YawInLocal,DEC);
-    Serial.println("\t");
-    count = 0;
-  }
-  else
-    count++;
+    if(UpdateFlagsLocal & PITCH_FLAG)
+    {
+      PitchInLocal = PitchInShared;
+    }
+    if(UpdateFlagsLocal & THRUST_FLAG)
+    {
+      ThrustInLocal = ThrustInShared;
+    }
+    if(UpdateFlagsLocal & YAW_FLAG)
+    {
+      YawInLocal = YawInShared;
+    }
+     
+      // clear shared copy of updated flags as we have already taken the updates
+      // we still have a local copy if we need to use it in UpdateFlagsLocal
+      // this needs to be cleared so that we aren't always checking these variables and
+      // run the risk of getting interrupts during the update
+      UpdateFlagsShared = 0;
 
-  // do any processing from here onwards
-  // only use the local values RollInLocal, PitchInLocal, ThrustInLocal and YawInLocal, the shared
-  // variables are always owned by the interrupt routines and should not be used in loop
+      
+      interrupts(); // turn back on interrupts - DO NOT USE SHARED VARIABLES ANYMORE
+      // remember when this update happened
+      LastRCUpdate = millis();
+  }
+
+
+  // only use the local values RollInLocal, PitchInLocal, ThrustInLocal and YawInLocal, from here on;
+  // the shared variables are always owned by the interrupt routines and should not be used in loop
 
   /**************************/
   /****   SERIAL TO i7   ****/
   /**************************/
-
-  // send the RC command messages to the i7 via ROS
+  // populate ROS variables so they can be accessed by the node
+  // after this *ROSPWM variables will be populated with the correct output
+  nh.spinOnce();
 
   /**************************/
-  /**** SERIAL FROM i7   ****/
-  /**************************/
+  /**** SELECTION LOGIC  ****/
+  /**************************/ 
+  // we want to make sure that the output is correct, so these are failsafes to decide when to
+  // use RC inputs, or when to listen to ROS. and also how to correctly identify a failsafe.
+  // Mix the i7/RC inputs
 
-  // receive the motor output commands from the i7 via ROS
+
+  // if our last RC update was more than 100ms ago, we've probably lost our RC
+  uint32_t now = millis();
+  if(now - LastRCUpdate > 100)
+  {
+    //Serial.println("lost RC");
+    RollOutMaster = 0;   
+    PitchOutMaster = 0;
+    ThrustOutMaster = 0;
+    YawOutMaster = 0;
+    /***I'm not sure this will work.  I think this will make the arduino*****/
+    /***output nothing, which will hopefully cause the autopilot to go into**/
+    /***failsafe mode.  Will require more testing in the future *************/
+  } 
+  else if(now - LastROSUpdate > 500)
+  {
+    //Serial.println("lost ROS");
+    RollOutMaster = 0;   
+    PitchOutMaster = 0;
+    ThrustOutMaster = 0;
+    YawOutMaster = 0;
+    /***I'm not sure this will work.  I think this will make the arduino*****/
+    /***output nothing, which will hopefully cause the autopilot to go into**/
+    /***failsafe mode.  Will require more testing in the future *************/
+  }                           
+  // let RC take over ROS
+  else if((abs((int)RollInLocal  - 1500) > 50) ||
+          (abs((int)PitchInLocal - 1500)  > 50) ||
+          (abs((int)YawInLocal   - 1500)    > 50) ) // if the RC transmitter is being used (sticks have moved)
+  {
+    RollOutMaster   = RollInLocal;  // then ignore the i7 commands and just listen to RC
+    PitchOutMaster  = PitchInLocal;
+    ThrustOutMaster = min(ThrustInLocal, ThrustROSPWMShared); 
+    YawOutMaster    = YawInLocal;    
+    digitalWrite(13, 1);   
+  }
+  else
+  {
+    RollOutMaster   = RollROSPWMShared;  // use i7 inputs gathered from ROS message
+    PitchOutMaster  = PitchROSPWMShared;
+    ThrustOutMaster = min(ThrustInLocal, ThrustROSPWMShared); 
+    YawOutMaster    = YawROSPWMShared; 
+    digitalWrite(13, 0);
+  }  
 
   /**************************/
   /**** OUTPUT TO MOTORS ****/
   /**************************/
-   
-  // this is a simple pass through mapping RC inputs directly to motors
-  
   // Check to see if the channel value has changed, this is indicated  
   // by the flags. For the simple pass through we don't really need this check,
   // but for a more complex project where a new signal requires significant processing,
   // this allows us to only calculate new values when we have new inputs
   if(UpdateFlagsLocal & ROLL_FLAG)
   {
-    if(Motor1.readMicroseconds() != RollInLocal)
+    if(Motor1.readMicroseconds() != RollOutMaster)
     {
-      Motor1.writeMicroseconds(RollInLocal);
+      Motor1.writeMicroseconds(RollOutMaster);
     }
   }
   
   if(UpdateFlagsLocal & PITCH_FLAG)
   {
-    if(Motor2.readMicroseconds() != PitchInLocal)
+    if(Motor2.readMicroseconds() != PitchOutMaster)
     {
-      Motor2.writeMicroseconds(PitchInLocal);
+      Motor2.writeMicroseconds(PitchOutMaster);
     }
   }
   
   if(UpdateFlagsLocal & THRUST_FLAG)
   {
-    if(Motor3.readMicroseconds() != ThrustInLocal)
+    if(Motor3.readMicroseconds() != ThrustOutMaster)
     {
-      Motor3.writeMicroseconds(ThrustInLocal);
+      Motor3.writeMicroseconds(ThrustOutMaster);
     }
   }
 
     if(UpdateFlagsLocal & YAW_FLAG)
   {
-    if(Motor4.readMicroseconds() != YawInLocal)
+    if(Motor4.readMicroseconds() != YawOutMaster)
     {
-      Motor4.writeMicroseconds(YawInLocal);
+      Motor4.writeMicroseconds(YawOutMaster);
     }
   }
 
-  
   UpdateFlagsLocal = 0;
+  
+
+//  throttle serial output (debugging)
+  if(count >= 10000)
+  {
+//    Serial.println("");
+//    Serial.print("Roll: ");
+//    Serial.print(RollOutMaster,DEC);
+//    Serial.print("\t");
+//    Serial.print("Pitch: ");
+//    Serial.print(PitchOutMaster,DEC);
+//    Serial.print("\t");
+//    Serial.print("Thrust: ");
+//    Serial.print(ThrustOutMaster,DEC);
+//    Serial.print("\t");
+//    Serial.print("Yaw: ");
+//    Serial.print(YawOutMaster,DEC);
+//    Serial.print("\t");
+//    Serial.print("LastUpdate: ");
+//    Serial.print(LastRCUpdate,DEC);
+//    Serial.print("\t");
+//    Serial.print("Now:");
+//    Serial.print(millis(),DEC);
+//    Serial.println("\t");
+    count = 0;
+    
+    
+
+    // Populate output message (for debug)  - map back to rad
+    command_msg.roll     = RollOutMaster;
+    command_msg.pitch    = PitchOutMaster;
+    command_msg.thrust   = ThrustOutMaster;
+    command_msg.yaw_rate = YawOutMaster;
+  
+   // Publish output message
+    chatter.publish( &command_msg );
+  }
+  else
+    count++;
 }
 
 
@@ -295,4 +394,20 @@ void updateYawcmd()
     YawInShared = (uint16_t)(micros() - YawStartEdgeISR);
     UpdateFlagsShared |= YAW_FLAG;
   }
+}
+
+
+/**************************/
+/****    ROS Callback  ****/
+/**************************/
+void commandCb( const relative_nav_msgs::Command& msg)
+{
+  // populate the *OutROS variables with the message from the i7
+  // converted to RC-Style PWM
+  RollROSPWMShared     = msg.roll*636.6 + 1500;      // -pi/4 rad -> 1000us | pi/4 -> 2000us
+  PitchROSPWMShared    = msg.pitch*636.6 + 1500;     // -pi/4 rad -> 1000us | pi/4 -> 2000us
+  ThrustROSPWMShared   = msg.thrust*8.108 + 1200;    //  0 N -> 1200us      | 37N -> 1500us
+  YawROSPWMShared      = msg.yaw_rate*159.2 + 1500; //  -pi rad/s -> 1000us | pi rad/s -> 2000us
+
+  LastROSUpdate = millis();
 }
