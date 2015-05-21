@@ -4,6 +4,8 @@ RC_Read is an arduino-ros node that receives servo signals from a standard trans
 
 This was demonstrated to work with a Naze32 Autopilot on a 600mm Hexacopter with an i7 running ROS on board.
 
+This node publishes a non-standard message found in BYU's MAGICC lab Relative Navigation code stack.  If you decide to use this node, and require this message, request information from the maintainers and we can help you get this message.  However, it shouldn't be very hard to create your own custom message for your application.  
+
 # License
 Copyright (c) 2015, James Jackson, Paul Nyholm, All rights reserved
 
